@@ -76,7 +76,31 @@ MAX_MESSAGE_LENGTH = 4096  # VK message character limit
 
 _KEYBOARD_BUTTONS: List[List[Tuple[str, str]]] = [
     [("🆕 Новый чат", "/new"), ("🔄 Сброс", "/reset")],
+    [("🤖 Модель", "/model"), ("❓ Помощь", "/help")],
 ]
+
+# Skill descriptions: English SKILL.md text → Russian, applied to outgoing VK text only.
+# Exact-match, longest first. Skill files and skill selection are not touched.
+def _load_skill_ru() -> List[Tuple[str, str]]:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skill_descriptions_ru.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        logger.warning("VK: skill description map not loaded — %s", exc)
+        return []
+    return sorted(((en, ru) for en, ru in data.items() if en and ru), key=lambda p: -len(p[0]))
+
+
+_SKILL_RU: List[Tuple[str, str]] = _load_skill_ru()
+
+
+def _localize_skill_descriptions(text: str) -> str:
+    for en, ru in _SKILL_RU:
+        if en in text:
+            text = text.replace(en, ru)
+    return text
+
 
 # Map button labels → slash commands so taps are treated as typed commands
 _LABEL_TO_COMMAND: Dict[str, str] = {
@@ -202,7 +226,7 @@ class VKPlatformAdapter(BasePlatformAdapter):
 
     # ── Connection lifecycle ─────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.token:
             logger.error("VK: VK_TOKEN is not set")
             return False
@@ -328,7 +352,6 @@ class VKPlatformAdapter(BasePlatformAdapter):
                 logger.warning("VK: failed to cache attachment type=%s — %s", att_type, exc)
 
         source = self.build_source(
-            platform="vkontakte",
             chat_id=peer_id,
             chat_name=chat_name,
             chat_type=chat_type,
@@ -341,7 +364,8 @@ class VKPlatformAdapter(BasePlatformAdapter):
             message_id=str(msg.get("conversation_message_id") or msg.get("id", "")),
             text=text,
             message_type=message_type,
-            attachments=file_paths or None,
+            media_urls=file_paths,
+            media_types=[_media_type_for(p) for p in file_paths],
         )
 
     def _resolve_user_name_sync(self, user_id: str) -> str:
@@ -385,11 +409,19 @@ class VKPlatformAdapter(BasePlatformAdapter):
 
     # ── Outbound messages ────────────────────────────────────────────────
 
-    async def send(self, chat_id: str, text: str, **kwargs: Any) -> SendResult:
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        text = content
         if not text:
             return SendResult(success=True)
-        reply_to: Optional[str] = kwargs.get("reply_to")
         text = _strip_markdown(text)
+        text = _localize_skill_descriptions(text)
         chunks = _split_text(text, MAX_MESSAGE_LENGTH)
         last: SendResult = SendResult(success=True)
         for chunk in chunks:
@@ -622,6 +654,15 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
+def _media_type_for(path: str) -> str:
+    """Best-effort MIME type from the cached file's extension."""
+    ext = os.path.splitext(path)[1].lower()
+    return {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif",
+        ".ogg": "audio/ogg", ".mp3": "audio/mpeg", ".wav": "audio/wav",
+    }.get(ext, "application/octet-stream")
+
+
 def _split_text(text: str, limit: int) -> List[str]:
     """Split text into chunks not exceeding VK's message length limit."""
     if len(text) <= limit:
@@ -648,6 +689,12 @@ def register(ctx: Any) -> None:
     """Entry point called by the Hermes plugin system."""
     ctx.register_platform(
         name="vkontakte",
-        adapter_cls=VKPlatformAdapter,
+        label="VKontakte",
+        adapter_factory=lambda cfg: VKPlatformAdapter(cfg),
         check_fn=check_vkontakte_requirements,
+        required_env=["VK_TOKEN"],
+        install_hint="pip install vk_api",
+        allowed_users_env="VK_ALLOWED_USERS",
+        allow_all_env="VK_ALLOW_ALL_USERS",
+        cron_deliver_env_var="VK_HOME_CHANNEL",
     )
